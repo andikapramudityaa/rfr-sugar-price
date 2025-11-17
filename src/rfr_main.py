@@ -10,6 +10,17 @@ from hijridate import Hijri, Gregorian
 
 matplotlib.use("module://matplotlib-backend-kitty")
 
+RFR_PARAMS = dict(
+    n_estimators=1500,
+    max_depth=None,
+    random_state=42,
+    n_jobs=-1,
+    min_samples_split=2,
+    min_samples_leaf=1,
+    max_features="sqrt",
+    bootstrap=True,
+)
+
 
 def get_dataset():
     file_path = "../dataset/sugar_prices.xlsx"
@@ -58,9 +69,9 @@ def cleanup_dataset(df):
 
     plt.figure(figsize=(10, 5))
     plt.plot(df["Date"], df["Price"])
-    plt.title("Riwayat Harga Gula")
-    plt.xlabel("Tanggal")
-    plt.ylabel("Harga (Rp/kg)")
+    plt.title("Sugar Price History")
+    plt.xlabel("Date")
+    plt.ylabel("Price (Rp/kg)")
     plt.grid(True, which="both", axis="both", linestyle="--", linewidth=0.5)
     plt.tight_layout()
     plt.savefig("../output/images/sugar_price_history.png", dpi=300)
@@ -77,28 +88,76 @@ def feature_engineering(data):
     # Trend (sequential index)
     data["trend"] = np.arange(len(data))
     # Lag features
-    for lag in [1, 7, 30, 60, 90]:
+    for lag in [1, 7, 30]:
         data[f"lag_{lag}_price"] = data["Price"].shift(lag)
     # Delta features
-    for delta in [30]:
+    for delta in [1, 7, 30]:
         data[f"delta_{delta}"] = data["Price"] - data["Price"].shift(delta)
-    for pct_delta in [30]:
-        data[f"pct_delta_{delta}"] = data["Price"].pct_change(delta)
-    # Slope features
-    for slope in [7, 30]:
-        data[f"slope_{slope}"] = data["Price"].diff(slope)
+    for pct_delta in [1, 7, 30]:
+        data[f"pct_delta_{pct_delta}"] = data["Price"].pct_change(delta)
     # Drop NaN from lag features
     data = data.dropna().reset_index(drop=True)
     # Ramadan feature
     data[["is_ramadan", "ramadan_day", "days_to_eid", "eid_window14"]] = data[
         "Date"
-    ].apply(_ramadan_eid_feats)
+    ].apply(ramadan_eid_feats)
+    data["is_christmas"] = data["Date"].apply(is_christmas_season)
+    data["is_covid"] = data["Date"].apply(is_covid_period)
 
     # Print feature engineering result
     print("Columns created :", list(data.columns))
     print_data(data, "Feature engineering result :")
 
     return data
+
+
+def ramadan_eid_feats(date_like):
+    d = pd.Timestamp(date_like)
+    h = Gregorian(d.year, d.month, d.day).to_hijri()
+
+    # Ramadan flag and day-of-Ramadan
+    is_ramadan = 1 if int(h.month) == 9 else 0
+    ramadan_day = int(h.day) if is_ramadan else 0
+
+    # Days to Eid al-Fitr (1 Shawwal) using same Hijri year
+    # if already far past, use next year
+    eid_same = Hijri(int(h.year), 10, 1).to_gregorian()
+    eid_same_ts = pd.Timestamp(
+        int(eid_same.year), int(eid_same.month), int(eid_same.day)
+    )
+    diff = (eid_same_ts - d).days
+    if diff < -15:
+        eid_next = Hijri(int(h.year) + 1, 10, 1).to_gregorian()
+        eid_ts = pd.Timestamp(
+            int(eid_next.year), int(eid_next.month), int(eid_next.day)
+        )
+        diff = (eid_ts - d).days
+    else:
+        eid_ts = eid_same_ts
+
+    # 14-day moving-holiday window around Eid: 7 days before through 6 days after
+    eid_window14 = 1 if -6 <= diff <= 7 else 0
+
+    return pd.Series(
+        {
+            "is_ramadan": int(is_ramadan),
+            "ramadan_day": int(ramadan_day),
+            "days_to_eid": int(diff),
+            "eid_window14": int(eid_window14),
+        }
+    )
+
+
+def is_christmas_season(date_like):
+    d = pd.Timestamp(date_like)
+    return int(d.month == 12 and 20 <= d.day <= 31)
+
+
+def is_covid_period(date_like):
+    d = pd.Timestamp(date_like)
+    start = pd.Timestamp("2020-03-01")
+    end = pd.Timestamp("2022-12-31")
+    return int(start <= d <= end)
 
 
 def build_model(data, use_full_data, test_ratio=0.2):
@@ -113,7 +172,7 @@ def build_model(data, use_full_data, test_ratio=0.2):
     y = data[target_col]
 
     if use_full_data:
-        # pakai semua data untuk train (untuk forecasting / compare_prediction)
+        # pakai semua data untuk train (untuk forecasting / komparasi)
         X_train, y_train = X, y
         X_test = y_test = None
     else:
@@ -124,16 +183,7 @@ def build_model(data, use_full_data, test_ratio=0.2):
 
     print(f"Training samples: {len(X_train)}")
 
-    model = RandomForestRegressor(
-        n_estimators=1500,
-        max_depth=None,
-        random_state=42,
-        n_jobs=-1,
-        min_samples_split=2,
-        min_samples_leaf=1,
-        max_features="sqrt",
-        bootstrap=True,
-    )
+    model = RandomForestRegressor(**RFR_PARAMS)
     model.fit(X_train, y_train)
 
     # evaluasi internal kalau X_test tidak None
@@ -146,42 +196,6 @@ def build_model(data, use_full_data, test_ratio=0.2):
         print(f"MAPE : {mape:.2f}%")
 
     return model, feature_cols
-
-
-def _ramadan_eid_feats(date_like):
-    d = pd.Timestamp(date_like)
-    h = Gregorian(d.year, d.month, d.day).to_hijri()
-
-    # 1) Ramadan flag and day-of-Ramadan (1..30)
-    is_ramadan = 1 if int(h.month) == 9 else 0
-    ramadan_day = int(h.day) if is_ramadan else 0
-
-    # 2) Days to Eid al-Fitr (1 Shawwal) using same Hijri year; if already far past, use next year
-    eid_same = Hijri(int(h.year), 10, 1).to_gregorian()  # 1 Shawwal
-    eid_same_ts = pd.Timestamp(
-        int(eid_same.year), int(eid_same.month), int(eid_same.day)
-    )
-    diff = (eid_same_ts - d).days
-    if diff < -15:
-        eid_next = Hijri(int(h.year) + 1, 10, 1).to_gregorian()
-        eid_ts = pd.Timestamp(
-            int(eid_next.year), int(eid_next.month), int(eid_next.day)
-        )
-        diff = (eid_ts - d).days
-    else:
-        eid_ts = eid_same_ts
-
-    # 3) 14-day moving-holiday window around Eid: 7 days before through 6 days after
-    eid_window14 = 1 if -6 <= diff <= 7 else 0
-
-    return pd.Series(
-        {
-            "is_ramadan": int(is_ramadan),
-            "ramadan_day": int(ramadan_day),
-            "days_to_eid": int(diff),
-            "eid_window14": int(eid_window14),
-        }
-    )
 
 
 def forecast_future_prices(model, data, horizon_days, feature_cols):
@@ -214,21 +228,14 @@ def forecast_future_prices(model, data, horizon_days, feature_cols):
                 )
                 new_row[p_col] = 0 if past == 0 else (new_row["Price"] - past) / past
 
-        for d in [7, 30]:
-            d_col = f"slope_{d}"
-            if d_col in feature_cols:
-                past = (
-                    df_future["Price"].iloc[-d]
-                    if len(df_future) > d
-                    else df_future["Price"].iloc[0]
-                )
-                new_row[d_col] = new_row["Price"] - past
-
         # update time features
         new_row["year"] = next_date.year
         new_row["month"] = next_date.month
         new_row["weekofyear"] = int(pd.Timestamp(next_date).isocalendar().week)
         new_row["trend"] = int((next_date - data["Date"].min()).days)
+
+        new_row["is_christmas"] = is_christmas_season(next_date)
+        new_row["is_covid"] = is_covid_period(next_date)
 
         h = Gregorian(next_date.year, next_date.month, next_date.day).to_hijri()
         new_row["is_ramadan"] = 1 if int(h.month) == 9 else 0
@@ -271,8 +278,8 @@ def forecast_future_prices(model, data, horizon_days, feature_cols):
     )
 
 
-def do_forecast(model, data, feature_cols):
-    future_range = 365 * 3
+def do_forecast(model, data, feature_cols, n_year):
+    future_range = 365 * n_year
     future_prices = forecast_future_prices(model, data, future_range, feature_cols)
 
     print_data(future_prices, "Future Prediction : ")
@@ -291,7 +298,6 @@ def do_forecast(model, data, feature_cols):
     plt.show()
 
 
-# Compare prediction with actual data for a target year
 def compare_prediction(data_full, target_year):
     start_of_year = pd.Timestamp(year=target_year, month=1, day=1)
     end_of_year = pd.Timestamp(year=target_year, month=12, day=31)
@@ -335,16 +341,6 @@ def compare_prediction(data_full, target_year):
         )
         return None
 
-    # Metric
-    rmse = np.sqrt(mean_squared_error(comp["Price"], comp["PredictedPrice"]))
-    mape = mean_absolute_percentage_error(comp["Price"], comp["PredictedPrice"]) * 100
-
-    print(f"\n=== Comparison for Year {target_year} ===")
-    print(f"Overlapping days: {len(comp):,}")
-    print(f"RMSE : {rmse:,.2f}")
-    print(f"MAPE : {mape:.2f}%")
-    print(comp.head())
-
     # Visualization
     out_csv = f"../output/csv/rfr_compare_actual_vs_predicted_{target_year}.csv"
     comp.to_csv(out_csv, index=False)
@@ -381,10 +377,13 @@ def print_data(df, title):
 df = get_dataset()
 df = cleanup_dataset(df)
 data = feature_engineering(df)
-# model, features = build_model(data, False, 0.1)
+model, features = build_model(data, False, 0.1)
 model, features = build_model(data, False, 0.2)
-# model, features = build_model(data, False, 0.25)
-# model, features = build_model(data, False, 0.3)
-# model, features = build_model(data, False, 0.4)
-# do_forecast(model, data, features)
+model, features = build_model(data, False, 0.25)
+model, features = build_model(data, False, 0.3)
+model, features = build_model(data, False, 0.4)
+
 compare_prediction(data, target_year=2025)
+
+model, features = build_model(data, True)
+do_forecast(model, data, features, n_year=1)
