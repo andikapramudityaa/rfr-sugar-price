@@ -11,7 +11,7 @@ from hijridate import Hijri, Gregorian
 matplotlib.use("module://matplotlib-backend-kitty")
 
 RFR_PARAMS = dict(
-    n_estimators=1500,
+    n_estimators=1000,
     max_depth=None,
     random_state=42,
     n_jobs=-1,
@@ -84,29 +84,26 @@ def feature_engineering(data):
     # Time features
     data["year"] = data["Date"].dt.year
     data["month"] = data["Date"].dt.month
-    data["weekofyear"] = data["Date"].dt.isocalendar().week.astype(int)
     # Trend (sequential index)
     data["trend"] = np.arange(len(data))
     # Lag features
-    for lag in [1, 7, 30]:
+    for lag in [1, 7, 30, 60, 90]:
         data[f"lag_{lag}_price"] = data["Price"].shift(lag)
     # Delta features
     for delta in [1, 7, 30]:
         data[f"delta_{delta}"] = data["Price"] - data["Price"].shift(delta)
-    for pct_delta in [1, 7, 30]:
-        data[f"pct_delta_{pct_delta}"] = data["Price"].pct_change(delta)
     # Drop NaN from lag features
     data = data.dropna().reset_index(drop=True)
     # Ramadan feature
     data[["is_ramadan", "ramadan_day", "days_to_eid", "eid_window14"]] = data[
         "Date"
     ].apply(ramadan_eid_feats)
-    data["is_christmas"] = data["Date"].apply(is_christmas_season)
-    data["is_covid"] = data["Date"].apply(is_covid_period)
 
     # Print feature engineering result
     print("Columns created :", list(data.columns))
     print_data(data, "Feature engineering result :")
+
+    data.to_csv("../output/csv/rfr_feature_sugar.csv", index=False)
 
     return data
 
@@ -146,18 +143,6 @@ def ramadan_eid_feats(date_like):
             "eid_window14": int(eid_window14),
         }
     )
-
-
-def is_christmas_season(date_like):
-    d = pd.Timestamp(date_like)
-    return int(d.month == 12 and 20 <= d.day <= 31)
-
-
-def is_covid_period(date_like):
-    d = pd.Timestamp(date_like)
-    start = pd.Timestamp("2020-03-01")
-    end = pd.Timestamp("2022-12-31")
-    return int(start <= d <= end)
 
 
 def build_model(data, use_full_data, test_ratio=0.2):
@@ -200,6 +185,7 @@ def build_model(data, use_full_data, test_ratio=0.2):
 
 def forecast_future_prices(model, data, horizon_days, feature_cols):
     df_future = data.copy()
+
     for _ in range(horizon_days):
         next_date = df_future["Date"].iloc[-1] + pd.Timedelta(days=1)
 
@@ -208,7 +194,7 @@ def forecast_future_prices(model, data, horizon_days, feature_cols):
         new_row["Date"] = next_date
 
         # update delta features
-        for d in [30]:
+        for d in [1, 7, 30]:
             d_col = f"delta_{d}"
             if d_col in feature_cols:
                 new_row[d_col] = new_row["Price"] - (
@@ -217,25 +203,10 @@ def forecast_future_prices(model, data, horizon_days, feature_cols):
                     else df_future["Price"].iloc[0]
                 )
 
-        # update percentage deltas (optional)
-        for d in [30]:
-            p_col = f"pct_delta_{d}"
-            if p_col in feature_cols:
-                past = (
-                    df_future["Price"].iloc[-d]
-                    if len(df_future) > d
-                    else df_future["Price"].iloc[0]
-                )
-                new_row[p_col] = 0 if past == 0 else (new_row["Price"] - past) / past
-
         # update time features
         new_row["year"] = next_date.year
         new_row["month"] = next_date.month
-        new_row["weekofyear"] = int(pd.Timestamp(next_date).isocalendar().week)
         new_row["trend"] = int((next_date - data["Date"].min()).days)
-
-        new_row["is_christmas"] = is_christmas_season(next_date)
-        new_row["is_covid"] = is_covid_period(next_date)
 
         h = Gregorian(next_date.year, next_date.month, next_date.day).to_hijri()
         new_row["is_ramadan"] = 1 if int(h.month) == 9 else 0
@@ -261,7 +232,7 @@ def forecast_future_prices(model, data, horizon_days, feature_cols):
         new_row["Price"] = y_next
 
         # update lag features using latest predicted prices
-        for lag in [1, 7, 30]:
+        for lag in [1, 7, 30, 60, 90]:
             lag_col = f"lag_{lag}_price"
             if lag_col in feature_cols:
                 new_row[lag_col] = (
@@ -294,7 +265,7 @@ def do_forecast(model, data, feature_cols, n_year):
     plt.ylabel("Price (Rp/kg)")
     plt.legend()
     plt.tight_layout()
-    plt.savefig("../output/images/forecast_future_prices.png", dpi=300)
+    plt.savefig("../output/images/forecast_future_sugar_prices.png", dpi=300)
     plt.show()
 
 
@@ -360,7 +331,8 @@ def compare_prediction(data_full, target_year):
     plt.grid(True, linestyle="--", linewidth=0.5)
     plt.tight_layout()
     plt.savefig(
-        f"../output/images/compare_actual_vs_predicted_{target_year}.png", dpi=300
+        f"../output/images/compare_sugar_actual_vs_predicted_{target_year}.png",
+        dpi=300,
     )
     plt.show()
 

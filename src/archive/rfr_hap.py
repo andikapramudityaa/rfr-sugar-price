@@ -1,0 +1,468 @@
+#!/home/reyvn/Dev/RFR_Sugar_Price/.venv/bin/python
+
+import pandas as pd
+import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+from hijridate import Hijri, Gregorian
+
+matplotlib.use("module://matplotlib-backend-kitty")
+
+RFR_PARAMS = dict(
+    n_estimators=1500,
+    max_depth=None,
+    random_state=42,
+    n_jobs=-1,
+    min_samples_split=2,
+    min_samples_leaf=1,
+    max_features="sqrt",
+    bootstrap=True,
+)
+
+HAP_START_DATES = [
+    "2018-01-01",  # baseline awal data
+    "2020-02-10",  # Permendag 7/2020
+    "2022-12-20",  # Perbadan Bapanas 11/2022
+    "2024-09-25",  # Perbadan Bapanas 12/2024
+]
+
+HAP_CONFIG = []
+
+
+def get_dataset():
+    file_path = "../dataset/sugar_prices.xlsx"
+    return pd.read_excel(file_path)
+
+
+def cleanup_dataset(df):
+    print(df.head())
+    # Drop unnecessary columns and index then tranpose the data frame
+    df = df.drop(columns=["No", "Komoditas (Rp)"]).iloc[[0]].T
+    # Reset index
+    df.reset_index(inplace=True)
+    # Rename header
+    df.columns = ["Date", "Price"]
+
+    # Convert column date to datetime format
+    df["Date"] = pd.to_datetime(
+        df["Date"].str.replace(" ", "").str.strip(),
+        format="%d/%m/%Y",
+        errors="coerce",
+    )
+
+    # Replace "-" with NaN & remove comma from all price and convert it to numeric
+    df["Price"] = (
+        df["Price"]
+        .astype(str)
+        .str.replace("-", "")
+        .str.replace(",", "")
+        .replace("", np.nan)
+    )
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+
+    # Sort by date just in case
+    df = df.sort_values("Date")
+    # Generate a full date range from min to max date
+    full_dates = pd.date_range(start=df["Date"].min(), end=df["Date"].max(), freq="D")
+    # Reindex dataframe to ensure all dates are present
+    df = df.set_index("Date").reindex(full_dates).rename_axis("Date").reset_index()
+    # Interpolate missing prices (based on nearest valid values)
+    df["Price"] = df["Price"].interpolate(method="linear")
+    df["Price"] = np.ceil(df["Price"])
+    # Forward/Backward fill for any remaining NaN at start/end
+    df["Price"] = df["Price"].ffill().bfill()
+
+    print_data(df, "Data Cleaning Result :")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(df["Date"], df["Price"])
+    plt.title("Sugar Price History")
+    plt.xlabel("Date")
+    plt.ylabel("Price (Rp/kg)")
+    plt.grid(True, which="both", axis="both", linestyle="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig("../output/images/sugar_price_history.png", dpi=300)
+    plt.show()
+
+    return df
+
+
+def feature_engineering(data):
+    # Time features
+    data["year"] = data["Date"].dt.year
+    data["month"] = data["Date"].dt.month
+    data["weekofyear"] = data["Date"].dt.isocalendar().week.astype(int)
+    # Trend (sequential index)
+    data["trend"] = np.arange(len(data))
+    # Lag features
+    for lag in [1, 7, 30]:
+        data[f"lag_{lag}_price"] = data["Price"].shift(lag)
+    # Delta features
+    for delta in [1, 7, 30]:
+        data[f"delta_{delta}"] = data["Price"] - data["Price"].shift(delta)
+    for pct_delta in [1, 7, 30]:
+        data[f"pct_delta_{pct_delta}"] = data["Price"].pct_change(delta)
+    # Drop NaN from lag features
+    data = data.dropna().reset_index(drop=True)
+    # Ramadan feature
+    data[["is_ramadan", "ramadan_day", "days_to_eid", "eid_window14"]] = data[
+        "Date"
+    ].apply(ramadan_eid_feats)
+    # Christmas feature
+    data["is_christmas"] = data["Date"].apply(is_christmas_season)
+    # Covid flag
+    data["is_covid"] = data["Date"].apply(is_covid_period)
+    # HAP flag
+    init_hap_from_data(data)
+    data[["hap_regime", "hap_price"]] = data["Date"].apply(hap_features)
+    data["gap_to_hap"] = data["Price"] - data["hap_price"]
+
+    # Print feature engineering result
+    print("Columns created :", list(data.columns))
+    print_data(data, "Feature engineering result :")
+
+    return data
+
+
+def ramadan_eid_feats(date_like):
+    d = pd.Timestamp(date_like)
+    h = Gregorian(d.year, d.month, d.day).to_hijri()
+
+    # Ramadan flag and day-of-Ramadan
+    is_ramadan = 1 if int(h.month) == 9 else 0
+    ramadan_day = int(h.day) if is_ramadan else 0
+
+    # Days to Eid al-Fitr (1 Shawwal) using same Hijri year
+    # if already far past, use next year
+    eid_same = Hijri(int(h.year), 10, 1).to_gregorian()
+    eid_same_ts = pd.Timestamp(
+        int(eid_same.year), int(eid_same.month), int(eid_same.day)
+    )
+    diff = (eid_same_ts - d).days
+    if diff < -15:
+        eid_next = Hijri(int(h.year) + 1, 10, 1).to_gregorian()
+        eid_ts = pd.Timestamp(
+            int(eid_next.year), int(eid_next.month), int(eid_next.day)
+        )
+        diff = (eid_ts - d).days
+    else:
+        eid_ts = eid_same_ts
+
+    # 14-day moving-holiday window around Eid: 7 days before through 6 days after
+    eid_window14 = 1 if -6 <= diff <= 7 else 0
+
+    return pd.Series(
+        {
+            "is_ramadan": int(is_ramadan),
+            "ramadan_day": int(ramadan_day),
+            "days_to_eid": int(diff),
+            "eid_window14": int(eid_window14),
+        }
+    )
+
+
+def is_christmas_season(date_like):
+    d = pd.Timestamp(date_like)
+    return int(d.month == 12 and 20 <= d.day <= 31)
+
+
+def is_covid_period(date_like):
+    d = pd.Timestamp(date_like)
+    start = pd.Timestamp("2020-03-01")
+    end = pd.Timestamp("2022-12-31")
+    return int(start <= d <= end)
+
+
+def init_hap_from_data(data: pd.DataFrame):
+    global HAP_CONFIG
+    if len(HAP_CONFIG) > 0:
+        return  # sudah pernah diinisialisasi
+
+    df_sorted = data.sort_values("Date")
+    config = []
+
+    for i, d_str in enumerate(HAP_START_DATES, start=1):
+        start_date = pd.Timestamp(d_str)
+
+        # cari baris terakhir yang tanggalnya <= start_date
+        eligible = df_sorted[df_sorted["Date"] <= start_date]
+        if len(eligible) == 0:
+            # kalau belum ada (misal start_date < min(Date)), pakai baris pertama
+            anchor_row = df_sorted.iloc[0]
+        else:
+            anchor_row = eligible.iloc[-1]
+
+        anchor_price = float(anchor_row["Price"])
+        anchor_date = pd.Timestamp(anchor_row["Date"])
+
+        config.append(
+            dict(
+                regime=i,
+                start=start_date,
+                anchor_date=anchor_date,
+                hap_price=anchor_price,
+            )
+        )
+
+    # urutkan berdasarkan tanggal mulai
+    HAP_CONFIG = sorted(config, key=lambda x: x["start"])
+    print("HAP_CONFIG :", HAP_CONFIG)
+
+
+def hap_features(date_like):
+    if not HAP_CONFIG:
+        raise RuntimeError(
+            "HAP_CONFIG belum diinisialisasi. Panggil init_hap_from_data(data) lebih dulu."
+        )
+
+    d = pd.Timestamp(date_like)
+    chosen = None
+    for cfg in HAP_CONFIG:
+        if d >= cfg["start"]:
+            chosen = cfg
+    if chosen is None:
+        # sebelum regime pertama -> pakai regime awal
+        chosen = HAP_CONFIG[0]
+
+    return pd.Series(
+        {
+            "hap_regime": int(chosen["regime"]),
+            "hap_price": float(chosen["hap_price"]),
+        }
+    )
+
+
+def build_model(data, use_full_data, test_ratio=0.2):
+    feature_cols = [
+        col
+        for col in data.columns
+        if col not in ["Date", "Price"] and np.issubdtype(data[col].dtype, np.number)
+    ]
+    target_col = "Price"
+
+    X = data[feature_cols]
+    y = data[target_col]
+
+    if use_full_data:
+        # pakai semua data untuk train (untuk forecasting / komparasi)
+        X_train, y_train = X, y
+        X_test = y_test = None
+    else:
+        # mode evaluasi internal (kalau kamu mau cek performa umum)
+        split_index = int(len(X) * (1 - test_ratio))
+        X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
+        y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+
+    print(f"Training samples: {len(X_train)}")
+
+    model = RandomForestRegressor(**RFR_PARAMS)
+    model.fit(X_train, y_train)
+
+    # evaluasi internal kalau X_test tidak None
+    if X_test is not None and len(X_test) > 0:
+        y_pred = model.predict(X_test)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mape = mean_absolute_percentage_error(y_test, y_pred) * 100
+        print("\nModel Evaluation Results")
+        print(f"RMSE : {rmse:,.2f}")
+        print(f"MAPE : {mape:.2f}%")
+
+    return model, feature_cols
+
+
+def forecast_future_prices(model, data, horizon_days, feature_cols):
+    df_future = data.copy()
+    for _ in range(horizon_days):
+        next_date = df_future["Date"].iloc[-1] + pd.Timedelta(days=1)
+
+        # copy last row
+        new_row = df_future.iloc[-1].copy()
+        new_row["Date"] = next_date
+
+        # update delta features
+        for d in [30]:
+            d_col = f"delta_{d}"
+            if d_col in feature_cols:
+                new_row[d_col] = new_row["Price"] - (
+                    df_future["Price"].iloc[-d]
+                    if len(df_future) > d
+                    else df_future["Price"].iloc[0]
+                )
+
+        # update percentage deltas (optional)
+        for d in [30]:
+            p_col = f"pct_delta_{d}"
+            if p_col in feature_cols:
+                past = (
+                    df_future["Price"].iloc[-d]
+                    if len(df_future) > d
+                    else df_future["Price"].iloc[0]
+                )
+                new_row[p_col] = 0 if past == 0 else (new_row["Price"] - past) / past
+
+        # update time features
+        new_row["year"] = next_date.year
+        new_row["month"] = next_date.month
+        new_row["weekofyear"] = int(pd.Timestamp(next_date).isocalendar().week)
+        new_row["trend"] = int((next_date - data["Date"].min()).days)
+
+        new_row["is_christmas"] = is_christmas_season(next_date)
+        new_row["is_covid"] = is_covid_period(next_date)
+
+        hap_series = hap_features(next_date)
+        new_row["hap_regime"] = hap_series["hap_regime"]
+        new_row["hap_price"] = hap_series["hap_price"]
+        new_row["gap_to_hap"] = new_row["Price"] - new_row["hap_price"]
+
+        h = Gregorian(next_date.year, next_date.month, next_date.day).to_hijri()
+        new_row["is_ramadan"] = 1 if int(h.month) == 9 else 0
+        new_row["ramadan_day"] = int(h.day) if new_row["is_ramadan"] == 1 else 0
+
+        eid_same = Hijri(int(h.year), 10, 1).to_gregorian()
+        eid_same_ts = pd.Timestamp(
+            int(eid_same.year), int(eid_same.month), int(eid_same.day)
+        )
+        _days = (eid_same_ts - next_date).days
+        if _days < -15:
+            eid_next = Hijri(int(h.year) + 1, 10, 1).to_gregorian()
+            eid_ts = pd.Timestamp(
+                int(eid_next.year), int(eid_next.month), int(eid_next.day)
+            )
+            _days = (eid_ts - next_date).days
+        new_row["days_to_eid"] = int(_days)
+        new_row["eid_window14"] = 1 if -6 <= _days <= 7 else 0
+
+        # predict
+        X_next = pd.DataFrame([new_row[feature_cols].values], columns=feature_cols)
+        y_next = model.predict(X_next)[0]
+        new_row["Price"] = y_next
+
+        # update lag features using latest predicted prices
+        for lag in [1, 7, 30]:
+            lag_col = f"lag_{lag}_price"
+            if lag_col in feature_cols:
+                new_row[lag_col] = (
+                    df_future["Price"].iloc[-lag]
+                    if len(df_future) > lag
+                    else df_future["Price"].iloc[0]
+                )
+
+        # append predicted row to future data
+        df_future = pd.concat([df_future, pd.DataFrame([new_row])], ignore_index=True)
+
+    return df_future.tail(horizon_days)[["Date", "Price"]].rename(
+        columns={"Price": "PredictedPrice"}
+    )
+
+
+def do_forecast(model, data, feature_cols, n_year):
+    future_range = 365 * n_year
+    future_prices = forecast_future_prices(model, data, future_range, feature_cols)
+
+    print_data(future_prices, "Future Prediction : ")
+
+    future_prices.to_csv("../output/csv/future_prices.csv", index=False)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(data["Date"], data["Price"], label="History")
+    plt.plot(future_prices["Date"], future_prices["PredictedPrice"], label="Forecast")
+    plt.title("Sugar Price - History & Forecast")
+    plt.xlabel("Date")
+    plt.ylabel("Price (Rp/kg)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("../output/images/forecast_future_prices.png", dpi=300)
+    plt.show()
+
+
+def compare_prediction(data_full, target_year):
+    start_of_year = pd.Timestamp(year=target_year, month=1, day=1)
+    end_of_year = pd.Timestamp(year=target_year, month=12, day=31)
+
+    base_data = data_full[data_full["Date"] < start_of_year].copy()
+    actual_year = data_full[
+        (data_full["Date"] >= start_of_year) & (data_full["Date"] <= end_of_year)
+    ][["Date", "Price"]].copy()
+
+    if base_data.empty:
+        print(
+            f"[Error] No historical data before {target_year} to build the forecast base."
+        )
+        return None
+    if actual_year.empty:
+        print(f"[Error] No actual data found for year {target_year} in the dataset.")
+        return None
+
+    # Train model
+    model_year, feature_cols_year = build_model(base_data, True)
+
+    # Forecast
+    horizon_days = len(actual_year)
+    preds_year = forecast_future_prices(
+        model_year, base_data, horizon_days, feature_cols_year
+    )
+
+    # Align dates
+    comp = (
+        actual_year.set_index("Date")
+        .join(preds_year.set_index("Date"), how="inner")
+        .reset_index()
+        .rename(columns={"index": "Date"})
+    )
+
+    # Clean NaNs and ensure we have something to score
+    comp = comp.dropna(subset=["Price", "PredictedPrice"])
+    if comp.empty:
+        print(
+            "[Error] No overlapping dates between actual and predicted after alignment."
+        )
+        return None
+
+    # Visualization
+    out_csv = f"../output/csv/rfr_compare_actual_vs_predicted_{target_year}.csv"
+    comp.to_csv(out_csv, index=False)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(comp["Date"], comp["Price"], label=f"Actual Price ({target_year})")
+    plt.plot(
+        comp["Date"],
+        comp["PredictedPrice"],
+        label=f"Predicted Price ({target_year})",
+        linestyle="--",
+    )
+    plt.title(f"Sugar Price: Prediction vs Actual ({target_year})")
+    plt.xlabel("Date")
+    plt.ylabel("Price (Rp/kg)")
+    plt.legend()
+    plt.grid(True, linestyle="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(
+        f"../output/images/compare_actual_vs_predicted_{target_year}.png", dpi=300
+    )
+    plt.show()
+
+    return comp
+
+
+def print_data(df, title):
+    print(title)
+    print(df.head())
+    print("...")
+    print(df.tail())
+
+
+df = get_dataset()
+df = cleanup_dataset(df)
+data = feature_engineering(df)
+model, features = build_model(data, False, 0.1)
+model, features = build_model(data, False, 0.2)
+model, features = build_model(data, False, 0.25)
+model, features = build_model(data, False, 0.3)
+model, features = build_model(data, False, 0.4)
+
+compare_prediction(data, target_year=2025)
+
+model, features = build_model(data, True)
+do_forecast(model, data, features, n_year=1)
