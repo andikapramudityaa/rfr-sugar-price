@@ -1,3 +1,4 @@
-dataset
+/dataset/*
+!/dataset/raw/
 output
 src/__pycache__
