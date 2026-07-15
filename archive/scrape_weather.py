@@ -43,12 +43,12 @@ provinces_coords = {
 
 start_date = "2022-01-01"
 end_date = "2026-03-01"
-output_file = "indonesian_weather_2022_2026.csv"
+output_file = "../output/indonesian_weather_2022_2026.csv"
 
 weather_records = []
 completed_provinces = []
 
-# 1. Load existing data so we don't overwrite it or start over
+# Load existing data so we don't overwrite it or start over
 if os.path.exists(output_file):
     try:
         existing_df = pd.read_csv(output_file)
@@ -62,7 +62,7 @@ if os.path.exists(output_file):
     except Exception as e:
         print(f"Could not read existing CSV. Starting fresh. Error: {e}")
 
-# 2. Filter out the provinces we already have
+# Filter out the provinces we already have
 remaining_provinces = {
     prov: coords
     for prov, coords in provinces_coords.items()
